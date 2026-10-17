@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hashflow"
+version = "2.0.0"
+description = "Hashflow: Ethical Monero Mining Wrapper with Stealth Limiter & Dashboard"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Hashflow Team", email = "legendincube@gmail.com" }]
+requires-python = ">=3.8"
+keywords = ["monero", "xmrig", "mining", "cryptocurrency", "termux"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Distributed Computing"
+]
+dependencies = [
+    "psutil>=5.9.0",
+    "rich>=13.0.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "websockets>=11.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio",
+    "httpx",
+]
+
+[project.urls]
+Homepage = "https://github.com/n30nfr0stblad3/Hashflow"
+Repository = "https://github.com/n30nfr0stblad3/Hashflow"
+Issues = "https://github.com/n30nfr0stblad3/Hashflow/issues"
+
+[project.scripts]
+hashflow = "hashflow.cli:main"
+hf = "hashflow.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["hashflow", "hashflow.*"]
+
+[tool.setuptools.package-data]
+hashflow = ["dashboard/static/*", "dashboard/static/**/*"]

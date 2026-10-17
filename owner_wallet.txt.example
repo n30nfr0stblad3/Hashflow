@@ -1,0 +1,6 @@
+# Place owner Monero wallet address here (one line)
+# Example: 4YourOwnerWalletAddressHere...
+# This file is read by Hashflow for the 2-5% dev donation
+# Leave empty or remove for solo mode (100% to contributor)
+
+4YourOwnerMoneroWalletAddressHere...

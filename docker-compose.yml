@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  hashflow:
+    build: .
+    container_name: hashflow-miner
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/root/.hashflow
+      - ./owner_wallet.txt:/app/owner_wallet.txt:ro
+      - ./miners.json:/app/miners.json
+    environment:
+      - HASHFLOW_POOL=pool.supportxmr.com:3333
+      - HASHFLOW_DASHBOARD_PORT=8080
+    restart: unless-stopped
+    # Example mining command override:
+    # command: ["hashflow", "mine", "YOUR_WALLET", "--username", "vps-miner", "--agree", "--dashboard", "--dashboard-host", "0.0.0.0", "--threads", "4"]
+    # For dashboard only (default):
+    command: ["hashflow", "dashboard", "--host", "0.0.0.0", "--port", "8080"]
+
+  # Optional: monitoring with Grafana (future)
+  # grafana:
+  #   image: grafana/grafana
+  #   ports:
+  #     - "3000:3000"
