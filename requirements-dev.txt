@@ -1,0 +1,3 @@
+# Hashflow is stdlib-only at runtime. Tests run with unittest (stdlib):
+#   python3 -m unittest discover -s tests
+# Optional: pytest tests/

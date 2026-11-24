@@ -1,0 +1,12 @@
+{
+  "appId": "io.hashflow.fleetcommand",
+  "appName": "Hashflow Fleet Command",
+  "webDir": "web",
+  "bundledWebRuntime": false,
+  "android": {
+    "allowMixedContent": false
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}

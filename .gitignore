@@ -205,3 +205,26 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# --- Hashflow ---
+# wallet material & device ledger must never be committed
+owner_wallet.txt
+miners.json
+miners.json.bak
+*.bak
+
+# fetched miner binaries
+/xmrig
+/xmrig.exe
+
+# android / capacitor build outputs
+node_modules/
+android/app/
+android/.gradle/
+android/build/
+*.apk
+*.aab
+*.keystore
+
+# dev tooling
+.pytest_cache/

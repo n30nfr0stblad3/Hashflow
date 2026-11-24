@@ -1,0 +1,19 @@
+{
+  "name": "Hashflow Fleet Command",
+  "short_name": "Hashflow",
+  "description": "Mission-control dashboard for Monero mining fleets: live telemetry, safety, analytics, and a mining copilot.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0b0e13",
+  "theme_color": "#0b0e13",
+  "icons": [
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

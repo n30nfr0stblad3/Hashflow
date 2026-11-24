@@ -1,235 +1,189 @@
 #!/usr/bin/env python3
+"""Hashflow — transparent Monero mining wrapper for XMRig.
+
+Fixes over v1 (see DESIGN.md):
+  * informed consent gate (--agree or interactive YES) before any mining
+  * honest donation accounting: static thread splits are only used when they
+    match the requested share within 1pp; otherwise wallets rotate over time
+  * donation is optional (--donation 0 / --no-donate); the owner wallet is
+    only required when a donation is active
+  * wallet validation, atomic group registry, stable device IDs
+  * cross-platform (Windows/macOS/Linux/Termux): no platform-specific calls
+  * child exit codes are surfaced instead of failing silently
+
+Usage:
+  python3 miner.py WALLET --username NAME --agree
+  python3 miner.py WALLET --username NAME --agree --donation 0
+  python3 miner.py --dashboard            # launch the Fleet Command UI (demo)
+"""
+from __future__ import annotations
+
 import argparse
-import json
-import math
 import os
-import re
-import shutil
 import signal
-import subprocess
 import sys
 import threading
-import time
-from collections import deque, defaultdict
 from pathlib import Path
-import hashlib
 
-# --- Configuration defaults ---
-DEFAULT_POOL = "pool.supportxmr.com:3333"
-DEFAULT_OWNER_CONFIG = "owner_wallet.txt"
-DEFAULT_XMRIG_NAME = "xmrig"
-DEFAULT_DONATE = 0
-DEFAULT_CPU_PRIORITY = 3
-MIN_DONATION = 0.02  # 2%
-MAX_DONATION = 0.05  # 5%
-GROUP_FILE = "miners.json"
-MAX_GROUP_SIZE = 100
-REFRESH_INTERVAL = 3.0  # seconds for status display
-SAMPLES = 8  # number of recent samples to average for smoothing
-# -------------------------------
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-_child_procs = []
-_stop_event = threading.Event()
+from hashflow.core import (  # noqa: E402
+    DEFAULT_CPU_PRIORITY, DEFAULT_DONATION, DEFAULT_POOL,
+    MAX_DONATION, MIN_DONATION,
+    build_allocation_plan, get_device_id, read_owner_wallet, register_user,
+    require_consent, validate_wallet,
+)
+from hashflow.stats import fmt_hashrate  # noqa: E402
+from hashflow.supervisor import Supervisor, find_xmrig  # noqa: E402
 
-stats_lock = threading.Lock()
-miner_stats = {
-    "contrib": {
-        "samples": deque(maxlen=SAMPLES),
-        "per_thread": defaultdict(lambda: deque(maxlen=SAMPLES)),
-        "last_total": 0.0,
-        "device_label": None
-    },
-    "owner": {
-        "samples": deque(maxlen=SAMPLES),
-        "per_thread": defaultdict(lambda: deque(maxlen=SAMPLES)),
-        "last_total": 0.0,
-        "device_label": None
-    }
-}
 
-def debug(msg, verbose):
-    if verbose:
-        print("[DEBUG]", msg)
-
-# ---- User/Group management ----
-
-def get_device_id():
-    # Use a hash of MAC + platform info for uniqueness (not perfect, but OK for Termux/VPS context)
-    import platform, uuid
-    unique_string = platform.node() + str(uuid.getnode()) + str(os.getpid())
-    device_hash = hashlib.sha256(unique_string.encode()).hexdigest()[:12]
-    return device_hash
-
-def register_user(username, device_id):
-    group_path = Path(GROUP_FILE)
-    if group_path.exists():
-        with group_path.open("r") as f:
-            try:
-                group_data = json.load(f)
-            except Exception:
-                group_data = []
-    else:
-        group_data = []
-
-    # Prevent duplicate device or username+device combo
-    group_data = [m for m in group_data if m.get("username") and m.get("device_id")]
-    for member in group_data:
-        if member["username"] == username and member["device_id"] == device_id:
-            return  # already present
-
-    if len(group_data) >= MAX_GROUP_SIZE:
-        print(f"[ERROR] Group/circle is at full capacity ({MAX_GROUP_SIZE} miners). Registration failed.")
-        print("Please contact the group admin to open a slot.")
-        sys.exit(1)
-
-    group_data.append({"username": username, "device_id": device_id})
-    with group_path.open("w") as f:
-        json.dump(group_data, f, indent=2)
-    print(f"[INFO] Registered '{username}' (device {device_id}). Group size: {len(group_data)}/{MAX_GROUP_SIZE}")
-
-# ------ XMRIG mgmt -------
-
-def find_xmrig(provided_path):
-    if provided_path:
-        xmrig_path = Path(provided_path)
-        if xmrig_path.is_file() and os.access(xmrig_path, os.X_OK):
-            return str(xmrig_path)
-        return None
-    # try cwd
-    p = Path.cwd() / DEFAULT_XMRIG_NAME
-    if p.is_file() and os.access(p, os.XMRIG_NAME):
-        return str(p)
-    # try PATH
-    which = shutil.which(DEFAULT_XMRIG_NAME)
-    if which:
-        return which
-    return None
-
-def read_owner_wallet(owner_config_path):
-    p = Path(owner_config_path)
-    if not p.exists():
-        return None
-    text = p.read_text().strip()
-    return text if text else None
-
-def compute_thread_split(total_threads, owner_fraction=MAX_DONATION):
-    owner_fraction = max(MIN_DONATION, min(owner_fraction, MAX_DONATION))
-    if total_threads <= 1:
-        return total_threads, 0
-    owner_threads = max(1, math.ceil(total_threads * owner_fraction))
-    if owner_threads >= total_threads:
-        owner_threads = total_threads - 1
-    contrib_threads = total_threads - owner_threads
-    return contrib_threads, owner_threads
-
-def build_xmrig_cmd(xmrig_path, wallet, threads, donate_level, cpu_priority, pool=DEFAULT_POOL, api_port=None):
-    cmd = [xmrig_path, "--url", pool, "--user", wallet, "--pass", "x", "--threads", str(threads),
-           "--donate-level", str(donate_level), "--cpu-priority", str(cpu_priority)]
-    if api_port:
-        cmd += ["--api-port", str(api_port)]
-    return cmd
-
-# Regexes for hashrate parsing
-GEN_HASH_RE = re.compile(r'([\d\.]+)\s*([kKmMgGtT]?H/s)')
-THREAD_HASH_RE = re.compile(r'(?:thread|thread#|thread\s+#|CPU thread\W*)(\d+).*?([\d\.]+)\s*([kKmMgGtT]?H/s)')
-
-UNIT_MULT = {
-    'H/s': 1.0,
-    'kH/s': 1e3, 'kh/s': 1e3,
-    'MH/s': 1e6, 'mh/s': 1e6,
-    'GH/s': 1e9, 'gh/s': 1e9,
-    'TH/s': 1e12, 'th/s': 1e12
-}
-
-def hr_to_float(value_str, unit_str):
-    unit = unit_str.strip()
-    mult = UNIT_MULT.get(unit, 1.0)
-    try:
-        return float(value_str) * mult
-    except Exception:
-        return 0.0
-
-# Main routine
-def main():
-    parser = argparse.ArgumentParser(description="XMRig wrapper with group cap and donation range.")
-    parser.add_argument("wallet", help="Your Monero wallet address")
-    parser.add_argument("--username", required=True, help="Your unique username for the group")
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="XMRig wrapper with transparent donation accounting "
+                    "and group registration.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("wallet", nargs="?", help="Your Monero wallet address")
+    parser.add_argument("--username", help="Your unique username for the group")
+    parser.add_argument("--agree", action="store_true",
+                        help="Confirm you have read the consent summary and are "
+                             "authorized to mine on this device")
     parser.add_argument("--xmrig", help="Path to xmrig binary")
-    parser.add_argument("--threads", type=int, help="Total mining threads")
-    parser.add_argument("--donation", type=float, default=MAX_DONATION, help="Fractional donation to owner (between 0.02 and 0.05)")
-    parser.add_argument("--owner-config", default=DEFAULT_OWNER_CONFIG, help="Owner wallet file")
+    parser.add_argument("--threads", type=int,
+                        help="Total mining threads (default: all CPU cores)")
+    parser.add_argument("--donation", type=float, default=DEFAULT_DONATION,
+                        help="Fraction of compute donated to the project "
+                             f"({MIN_DONATION:.0%}-{MAX_DONATION:.0%}; 0 disables)")
+    parser.add_argument("--no-donate", action="store_true",
+                        help="Shortcut for --donation 0")
+    parser.add_argument("--mode", choices=("auto", "threads", "timeslice"),
+                        default="auto",
+                        help="Allocation mode: static thread split vs wallet "
+                             "rotation over time (auto picks the accurate one)")
+    parser.add_argument("--owner-config", default="owner_wallet.txt",
+                        help="File holding the project owner wallet address")
     parser.add_argument("--pool", default=DEFAULT_POOL, help="Mining pool")
-    parser.add_argument("--refresh", type=float, default=REFRESH_INTERVAL, help="Refresh interval for stats")
-    parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument("--skip-wallet-check", action="store_true",
+                        help="Skip Monero address format validation")
+    parser.add_argument("--group-file", default="miners.json",
+                        help="Group registration ledger")
+    parser.add_argument("--dashboard", action="store_true",
+                        help="Launch the Fleet Command web dashboard (demo mode) "
+                             "instead of mining")
+    parser.add_argument("--cpu-priority", type=int, default=DEFAULT_CPU_PRIORITY,
+                        help="XMRig CPU priority (1-5)")
+    return parser
 
-    # Clamp donation
-    donation = max(MIN_DONATION, min(MAX_DONATION, args.donation))
-    if args.donation != donation:
-        print(f"[INFO] Donation clamped to {donation * 100:.1f}%")
 
-    # Group registration
-    device_id = get_device_id()
-    register_user(args.username, device_id)
+def _die(msg: str) -> None:
+    print(f"[ERROR] {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run_dashboard(port: int = 8765) -> int:
+    from hashflow.server import main as server_main
+    return server_main(["--demo", "--port", str(port)])
+
+
+def main(argv=None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    if args.dashboard:
+        return run_dashboard()
+
+    if not args.wallet:
+        parser.print_help()
+        _die("a wallet address is required (or use --dashboard).")
+    if not args.username:
+        _die("--username is required so the group ledger can identify this device.")
+
+    if not args.skip_wallet_check:
+        ok, reason = validate_wallet(args.wallet)
+        if not ok:
+            _die(f"invalid wallet address: {reason} (use --skip-wallet-check to override)")
+
+    donation = 0.0 if args.no_donate else args.donation
+    if not (MIN_DONATION <= donation <= MAX_DONATION):
+        print(f"[INFO] Donation clamped to {max(MIN_DONATION, min(MAX_DONATION, donation)):.0%}")
+        donation = max(MIN_DONATION, min(MAX_DONATION, donation))
+
+    owner_wallet = None
+    if donation > 0:
+        owner_wallet = read_owner_wallet(args.owner_config)
+        if not owner_wallet:
+            _die(
+                f"Donation is enabled ({donation:.0%}) but no owner wallet was found in "
+                f"'{args.owner_config}'. Create that file with the project wallet, or run "
+                "with --no-donate to mine 100% to your own wallet."
+            )
+
+    total_threads = args.threads or os.cpu_count() or 1
+    if total_threads < 1:
+        _die("--threads must be >= 1")
+    mode = None if args.mode == "auto" else args.mode
+    plan = build_allocation_plan(total_threads, donation, force_mode=mode)
+
+    # Group registration (stable device id — no PID component)
+    ok, message, _ = register_user(args.username, get_device_id(),
+                                  group_file=args.group_file)
+    print(f"[INFO] {message}")
+    if not ok:
+        sys.exit(1)
 
     xmrig_bin = find_xmrig(args.xmrig)
     if not xmrig_bin:
-        print("[ERROR] Could not find xmrig binary.")
+        hint = ""
+        if args.xmrig:
+            hint = " Check the path and that the file is executable (chmod +x)."
+        _die("Could not find the xmrig binary. Run scripts/fetch_xmrig.py to "
+             f"download it automatically, or pass --xmrig PATH.{hint}")
+
+    # Informed consent — prints the EXACT realized split before mining
+    if not require_consent(args.agree, args.wallet, owner_wallet, donation,
+                           plan, args.pool):
         sys.exit(1)
 
-    owner_wallet = read_owner_wallet(args.owner_config)
-    if not owner_wallet:
-        print("[ERROR] Owner wallet configuration missing.")
-        sys.exit(1)
+    print(f"[PLAN] {plan.summary}")
 
-    # Thread split
-    total_threads = args.threads or os.cpu_count()
-    contrib_threads, owner_threads = compute_thread_split(total_threads, owner_fraction=donation)
+    events_lock = threading.Lock()
 
-    # Show assignment
-    if not args.quiet:
-        print(f"Total threads: {total_threads} | You: {contrib_threads} | Owner: {owner_threads}")
-        print(f"Donation share: {donation*100:.1f}%")
-        print(f"Mining pool: {args.pool}")
+    def on_event(kind: str, data: dict) -> None:
+        with events_lock:
+            if kind == "speed":
+                label = data.get("label", "?").upper()
+                print(f"[{label}] {fmt_hashrate(data.get('hashrate', 0.0))}")
+            elif kind == "share":
+                print(f"[SHARE] accepted={data.get('accepted')} "
+                      f"rejected={data.get('rejected')}")
+            elif kind in ("proc_exit", "proc_failed", "proc_restart"):
+                print(f"[WATCHDOG] {kind}: {data}")
 
-    # Start both subprocesses
-    contrib_cmd = build_xmrig_cmd(xmrig_bin, args.wallet, contrib_threads, 0, DEFAULT_CPU_PRIORITY, pool=args.pool)
-    owner_cmd = build_xmrig_cmd(xmrig_bin, owner_wallet, owner_threads, 0, DEFAULT_CPU_PRIORITY, pool=args.pool)
-
-    contrib_proc = subprocess.Popen(contrib_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    owner_proc = subprocess.Popen(owner_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    _child_procs.extend([contrib_proc, owner_proc])
+    sup = Supervisor(
+        xmrig_path=xmrig_bin,
+        plan=plan,
+        contrib_wallet=args.wallet,
+        owner_wallet=owner_wallet,
+        pool=args.pool,
+        cpu_priority=args.cpu_priority,
+        on_event=on_event,
+    )
 
     def shutdown(signum, frame):
-        print("Exiting, terminating miners.")
-        _stop_event.set()
-        for proc in _child_procs:
+        print("\nExiting, terminating miners.")
+        sup.stop()
+
+    for sig_name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
             try:
-                proc.terminate()
-            except Exception:
+                signal.signal(sig, shutdown)
+            except (ValueError, OSError):
                 pass
-        sys.exit(0)
 
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    sup.run()
+    return 0
 
-    def monitor(proc, label):
-        for line in iter(proc.stdout.readline, b''):
-            try:
-                line_str = line.decode().strip()
-            except Exception:
-                continue
-            if not args.quiet:
-                print(f"[{label}] {line_str}")
-            # ... could add hash parsing/stats
-
-    t1 = threading.Thread(target=monitor, args=(contrib_proc, "CONTRIB"))
-    t2 = threading.Thread(target=monitor, args=(owner_proc, "OWNER"))
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
